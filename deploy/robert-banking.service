@@ -1,0 +1,20 @@
+[Unit]
+Description=Robert Banking - Sincronización diaria de saldos (solo lectura)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+UMask=0077
+WorkingDirectory=/home/pi/Code_Projects/robert-banking
+EnvironmentFile=/home/pi/Code_Projects/robert-banking/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/home/pi/Code_Projects/robert-banking/.venv/bin/python /home/pi/Code_Projects/robert-banking/sync_balances.py
+ExecStartPost=-/home/pi/Code_Projects/robert-banking/.venv/bin/python /home/pi/Code_Projects/robert-banking/publish_shared_balance.py
+TimeoutStartSec=240
+NoNewPrivileges=true
+
+#[Install]
+#WantedBy=multi-user.target
