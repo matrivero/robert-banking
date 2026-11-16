@@ -1,0 +1,11 @@
+.env
+*.pem
+*sandbox_session*.json
+*production_session*.json
+*.db
+*.db-*
+data/
+__pycache__/
+.venv/
+.pytest_cache/
+account_aliases.json
