@@ -9,3 +9,4 @@ __pycache__/
 .venv/
 .pytest_cache/
 account_aliases.json
+google-sheets-service-account.json

@@ -12,6 +12,8 @@ dependencies = [
     "click==8.5.1",
     "cryptography==50.0.2",
     "fastapi==0.162.5",
+    "google-auth>=2.62.2",
+    "gspread>=6.2.1",
     "h11==0.16.0",
     "httptools==0.9.0",
     "idna==3.20",
