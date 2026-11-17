@@ -10,3 +10,4 @@ __pycache__/
 .pytest_cache/
 account_aliases.json
 google-sheets-service-account.json
+README_ES.md

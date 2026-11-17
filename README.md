@@ -1,122 +1,125 @@
 # Robert Banking
 
-**Sincronización de saldos de Banco Sabadell con Enable Banking, SQLite, Hermes Agent y Google Sheets.**
+**Banco Sabadell balance synchronization with Enable Banking, SQLite, Hermes Agent, and Google Sheets.**
 
-> Proyecto personal de **consulta de información bancaria en modo solo lectura** (AIS). La Raspberry Pi ejecuta el acceso al banco; Hermes/Robert consume únicamente archivos de resultados. De manera independiente, se publica **solo el saldo contable de la cuenta compartida** en un Google Sheet privado. No se inician transferencias ni se ejecutan pagos.
+> Personal project for **read-only access to banking information** (AIS). The Raspberry Pi accesses the bank; Hermes/Robert consumes only the resulting files. Separately, **only the booked balance of the shared account** is published to a private Google Sheet. No transfers are initiated and no payments are made.
 >
-> 
-> **Alcance de este README (noviembre de 2026):** la estructura del repositorio procede de la captura del proyecto; los contratos de datos, las funciones y los valores predeterminados de `sync_balances.py` proceden de su código compartido; `robert-banking.service` y el publicador se basan en los archivos compartidos durante el desarrollo. **No se ha inspeccionado el contenido de `authorize_sabadell.py`, el `SKILL.md` realmente instalado ni el `docker-compose`/stack efectivo de Hermes.** En esas secciones se incluyen procedimientos y **ejemplos de reconstrucción**, identificados como tales; antes de reutilizarlos, compáralos con la instalación actual.
+>
+> **Scope of this README (November 2026):** the repository structure is based on a screenshot of the project; the data contracts, functions, and default values for `sync_balances.py` are based on its shared source code; `robert-banking.service` and the publisher are based on files shared during development. **The contents of `authorize_sabadell.py`, the `SKILL.md` actually installed, and the effective Hermes `docker-compose`/stack have not been inspected.** The relevant sections provide procedures and **reconstruction examples**, identified as such. Compare them with the current installation before reusing them.
 
-## Índice
+## Table of contents
 
-1. [Qué hace y qué no hace](#1-qué-hace-y-qué-no-hace)
-2. [Arquitectura y flujos](#2-arquitectura-y-flujos)
-3. [Estructura del proyecto](#3-estructura-del-proyecto)
-4. [Archivos excluidos de Git y cómo recrearlos](#4-archivos-excluidos-de-git-y-cómo-recrearlos)
-5. [Modelo de datos, saldos y formatos de salida](#5-modelo-de-datos-saldos-y-formatos-de-salida)
-6. [Instalación desde cero](#6-instalación-desde-cero)
-7. [Servicio systemd y cron de Linux](#7-servicio-systemd-y-cron-de-linux)
-8. [Carpeta compartida entre la Raspberry y Hermes](#8-carpeta-compartida-entre-la-raspberry-y-hermes)
-9. [Skill `banking-monitor` y cron de Hermes](#9-skill-banking-monitor-y-cron-de-hermes)
-10. [Publicación a Google Sheets y consumo desde Claude](#10-publicación-a-google-sheets-y-consumo-desde-claude)
-11. [Pruebas y verificación](#11-pruebas-y-verificación)
-12. [Errores frecuentes y mantenimiento](#12-errores-frecuentes-y-mantenimiento)
-13. [Seguridad, copias y restauración](#13-seguridad-copias-y-restauración)
-14. [Referencias y puntos pendientes](#14-referencias-y-puntos-pendientes)
+1. [What it does and does not do](#1-what-it-does-and-does-not-do)
+2. [Architecture and data flows](#2-architecture-and-data-flows)
+3. [Project structure](#3-project-structure)
+4. [Files excluded from Git and how to recreate them](#4-files-excluded-from-git-and-how-to-recreate-them)
+5. [Data model, balances, and output formats](#5-data-model-balances-and-output-formats)
+6. [Installation from scratch](#6-installation-from-scratch)
+7. [systemd service and Linux cron](#7-systemd-service-and-linux-cron)
+8. [Shared directory between the Raspberry Pi and Hermes](#8-shared-directory-between-the-raspberry-pi-and-hermes)
+9. [`banking-monitor` skill and Hermes cron](#9-banking-monitor-skill-and-hermes-cron)
+10. [Publishing to Google Sheets and accessing data from Claude](#10-publishing-to-google-sheets-and-accessing-data-from-claude)
+11. [Testing and verification](#11-testing-and-verification)
+12. [Common errors and maintenance](#12-common-errors-and-maintenance)
+13. [Security, backups, and restoration](#13-security-backups-and-restoration)
+14. [References and outstanding items](#14-references-and-outstanding-items)
 
-## 1. Qué hace y qué no hace
+## 1. What it does and does not do
 
-Este proyecto permite:
+This project can:
 
-- Consultar periódicamente los saldos de **dos cuentas** de Banco Sabadell mediante la API AIS de Enable Banking: **Cuenta compartida** y **Cuenta personal**.
-- Guardar un histórico local de *snapshots* en **SQLite**, evitando que la identidad de la cuenta dependa de su posición en la respuesta de la API.
-- Generar cuatro artefactos de lectura para **Robert**, un agente basado en **Hermes Agent** dentro de Docker.
-- Enviar un resumen programado mediante el **cron de Hermes** (p. ej. Telegram), tomando las cifras del informe determinista generado por Python.
-- Publicar **exclusivamente la Cuenta compartida** en un Google Sheet privado, para que otro asistente (Claude) pueda relacionar su saldo con los pagos previstos en Google Calendar.
+- Periodically retrieve the balances of **two Banco Sabadell accounts** through the Enable Banking AIS API: **Cuenta compartida** (shared account) and **Cuenta personal** (personal account).
+- Store a local history of *snapshots* in **SQLite**, ensuring that account identity does not depend on its position in the API response.
+- Generate four read-only data artifacts for **Robert**, an agent based on **Hermes Agent** running inside Docker.
+- Send a scheduled summary using **Hermes cron** (e.g., via Telegram), taking the figures from the deterministic report generated by Python.
+- Publish **only Cuenta compartida** to a private Google Sheet so that another assistant (Claude) can relate its balance to upcoming payments in Google Calendar.
 
-**No hace:** pagos, transferencias, modificaciones de cuentas, descarga de movimientos bancarios en la versión actual, acceso directo de Hermes al banco ni acceso de Claude a las claves de Enable Banking.
+**It does not:** make payments or transfers, modify accounts, download bank transactions in the current version, give Hermes direct access to the bank, or give Claude access to Enable Banking keys.
 
-### Terminología importante
+### Important terminology
 
-- **`CLBD`**: saldo contable (*closing booked balance*); **no equivale necesariamente al saldo disponible**.
-- **`XPCD`**: saldo esperado, si el banco lo proporciona; tampoco debe rotularse como disponible.
-- **`fetched_at`**: instante UTC en que nuestro script terminó la consulta.
-- **`reference_date`**: fecha de referencia informada por el banco para ese saldo; puede ser distinta de la fecha de consulta.
-- **`identification_hash`**: identificador de la cuenta, utilizado para mantener la misma identidad entre sesiones bancarias.
-- **`uid`**: identificador de cuenta dentro de una sesión de Enable Banking. **Puede cambiar al renovar la autorización**.
+- **`CLBD`**: booked balance (*closing booked balance*); **not necessarily equivalent to the available balance**.
+- **`XPCD`**: expected balance, if provided by the bank; it must not be labeled as available either.
+- **`fetched_at`**: the UTC timestamp when our script finished the request.
+- **`reference_date`**: the reference date provided by the bank for that balance; it may differ from the request date.
+- **`identification_hash`**: account identifier used to preserve the same account identity across banking sessions.
+- **`uid`**: account identifier within an Enable Banking session. **It may change when authorization is renewed**.
 
-## 2. Arquitectura y flujos
+## 2. Architecture and data flows
 
 ```mermaid
 flowchart TD
-    EB[Enable Banking / Banco Sabadell] -->|HTTPS saliente: AIS| SYNC[Host Raspberry Pi 5\nsync_balances.py]
-    SESSION[(Clave PEM y sesión AIS\nSOLO en host)] -.-> SYNC
-    ALIASES[(account_aliases.json\nSOLO en host)] -.-> SYNC
+    EB[Enable Banking / Banco Sabadell] -->|Outbound HTTPS: AIS| SYNC[Host Raspberry Pi 5\nsync_balances.py]
+    SESSION[(PEM key and AIS session\nHOST ONLY)] -.-> SYNC
+    ALIASES[(account_aliases.json\nHOST ONLY)] -.-> SYNC
     SYNC --> DB[(SQLite\ndata/banking.db)]
-    SYNC --> SHARE[/Directorio compartido en host\n/home/pi/robert-banking-share/]
+    SYNC --> SHARE[/Shared host directory\n/home/pi/robert-banking-share/]
     DB --> PUB[publish_shared_balance.py\nExecStartPost]
     ALIASES -.-> PUB
-    PUB -->|HTTPS saliente| SHEET[Google Sheet privado\nsolo Cuenta compartida]
+    PUB -->|Outbound HTTPS| SHEET[Private Google Sheet\nCuenta compartida only]
     SHARE -->|bind mount :ro| HERMES[Hermes Agent / Robert\n/opt/data/banking/]
-    HERMES -->|skill + cron| TELEGRAM[Resumen a Telegram]
-    SHEET --> CLAUDE[Claude de la pareja]
-    CAL[Google Calendar\npagos programados] --> CLAUDE
+    HERMES -->|skill + cron| TELEGRAM[Telegram summary]
+    SHEET --> CLAUDE[Partner's Claude]
+    CAL[Google Calendar\nscheduled payments] --> CLAUDE
 ```
 
-**Existen dos planificadores diferentes** y deben mantenerse separados:
 
-| Sistema | Dónde se ejecuta | Función | Horario de referencia |
+**There are two separate schedulers**, and they must remain independent:
+
+| System | Where it runs | Purpose | Reference schedule |
 |---|---|---|---|
-| `cron` de Linux + `systemd` | **Host** Raspberry Pi | Obtener saldos, persistirlos y publicar Sheets | **07:55, 12:55 y 18:55** todos los días |
-| Cron integrado de Hermes | **Contenedor** Hermes | Leer resultados y enviar un informe | **08:05** diario: ejemplo usado para `Robert - Resumen Sabadell`; verificar el cron instalado |
+| Linux `cron` + `systemd` | Raspberry Pi **host** | Retrieve and persist balances, and publish to Sheets | **07:55, 12:55, and 18:55** every day |
+| Built-in Hermes cron | Hermes **container** | Read results and send a report | **08:05** daily: example used for `Robert - Resumen Sabadell`; verify the installed cron job |
 
-No hay ningún servidor HTTP bancario expuesto públicamente: tanto Enable Banking como Google Sheets se consultan por **conexiones salientes** desde la Raspberry. Hermes lee el directorio montado de manera local.
+No banking HTTP server is publicly exposed: both Enable Banking and Google Sheets are accessed through **outbound connections** from the Raspberry Pi. Hermes reads the locally mounted directory.
 
-## 3. Estructura del proyecto
+## 3. Project structure
 
-Ruta de trabajo en la Raspberry:
+Working directory on the Raspberry Pi:
 
 ```text
 /home/pi/Code_Projects/robert-banking/
-├── .gitignore                         # Versionado
-├── README.md                          # Este documento (añadir al repositorio)
-├── pyproject.toml                     # Versionado: metadatos y dependencias
-├── uv.lock                            # Versionado: versiones resueltas
-├── authorize_sabadell.py              # Versionado: autorización AIS (CLI no auditada aquí)
-├── sync_balances.py                   # Versionado: banco → SQLite → JSON/texto
-├── publish_shared_balance.py          # Versionado: SQLite → Google Sheet
-├── .env                               # IGNORADO: configuración local
-├── account_aliases.json               # IGNORADO: hash → alias de cuentas
-├── robert_banking_production.pem      # IGNORADO: clave privada Enable Banking
-├── robert_banking_sandbox.pem         # IGNORADO: clave privada sandbox
-├── production_session.json            # IGNORADO: sesión AIS autorizada
-├── sandbox_session.json               # IGNORADO: sesión AIS de pruebas
-├── google-sheets-service-account.json # IGNORADO: credencial privada Google
-├── data/                               # IGNORADO: base de datos y ficheros SQLite
+├── .gitignore                         # Tracked
+├── README.md                          # This document (add to repository)
+├── pyproject.toml                     # Tracked: metadata and dependencies
+├── uv.lock                            # Tracked: resolved versions
+├── authorize_sabadell.py              # Tracked: AIS authorization (CLI not audited here)
+├── sync_balances.py                   # Tracked: bank → SQLite → JSON/text
+├── publish_shared_balance.py          # Tracked: SQLite → Google Sheet
+├── .env                               # IGNORED: local configuration
+├── account_aliases.json               # IGNORED: hash → account aliases
+├── robert_banking_production.pem      # IGNORED: Enable Banking private key
+├── robert_banking_sandbox.pem         # IGNORED: sandbox private key
+├── production_session.json            # IGNORED: authorized AIS session
+├── sandbox_session.json               # IGNORED: test AIS session
+├── google-sheets-service-account.json # IGNORED: private Google credential
+├── data/                               # IGNORED: SQLite database and files
 │   └── banking.db
-├── .venv/                              # IGNORADO: entorno virtual uv
-└── __pycache__/                        # IGNORADO: archivos temporales de Python
+├── .venv/                              # IGNORED: uv virtual environment
+└── __pycache__/                        # IGNORED: temporary Python files
 ```
 
-> **Muy importante:** que un archivo esté *ignorado por Git* **no significa que sea prescindible**. Algunos pueden recrearse (como `.venv` o SQLite), pero otros necesitan nueva autorización o recuperación segura de claves. El repositorio de código **no constituye por sí solo un backup completo y operativo**.
 
-### Archivos fuera del repositorio
+> **Very important:** a file being *ignored by Git* **does not mean it is unnecessary**. Some files can be recreated (such as `.venv` or SQLite), while others require renewed authorization or secure recovery of keys. **The code repository alone is not a complete, operational backup.**
+
+### Files outside the repository
 
 ```text
-/etc/systemd/system/robert-banking.service    # Unidad systemd del host
-crontab de root                               # Disparo del servicio 3 veces al día
-/home/pi/robert-banking-share/                # JSON y TXT generados por el host
-~/.hermes/skills/banking-monitor/SKILL.md     # Skill en el contenedor/perfil Hermes
-~/.hermes/cron/jobs.json                      # Jobs del scheduler Hermes
-Configuración de Portainer/Docker            # Bind mount de la carpeta compartida
-Google Cloud + Google Sheet                   # Credencial/permiso y documento externo
+/etc/systemd/system/robert-banking.service    # Host systemd unit
+root crontab                               # Starts service 3 times a day
+/home/pi/robert-banking-share/                # JSON and TXT generated by host
+~/.hermes/skills/banking-monitor/SKILL.md     # Skill in Hermes container/profile
+~/.hermes/cron/jobs.json                      # Hermes scheduler jobs
+Portainer/Docker configuration            # Shared directory bind mount
+Google Cloud + Google Sheet                   # External credential/permission and document
 ```
 
-Las rutas `~/.hermes/...` son **internas al perfil que ejecuta el gateway**; `~` no necesariamente es `/home/pi` dentro de Docker.
 
-## 4. Archivos excluidos de Git y cómo recrearlos
+The `~/.hermes/...` paths are **internal to the profile running the gateway**; `~` does not necessarily refer to `/home/pi` inside Docker.
 
-La captura muestra estas reglas principales de `.gitignore`:
+## 4. Files excluded from Git and how to recreate them
+
+The screenshot shows these main `.gitignore` rules:
 
 ```gitignore
 .env
@@ -133,164 +136,171 @@ account_aliases.json
 google-sheets-service-account.json
 ```
 
-Si en el futuro se mueve el JSON de Google a `secrets/`, **añadir `secrets/` al `.gitignore`**: la regla actual solo cubre el nombre exacto de la credencial, no cualquier archivo JSON secreto en otras ubicaciones.
 
-### 4.1 `.env` — configuración local (NO COMMIT)
+If the Google JSON file is moved to `secrets/` in the future, **add `secrets/` to `.gitignore`**: the current rule covers only the exact credential filename, not arbitrary secret JSON files in other locations.
 
-Plantilla representativa para **producción**, con rutas de la instalación existente:
+### 4.1 `.env` — local configuration (DO NOT COMMIT)
+
+Representative **production** template, using paths from the existing installation:
 
 ```dotenv
-# Enable Banking: valores reales obtenidos en el portal de Enable Banking
+# Enable Banking: actual values obtained from the Enable Banking portal
 EB_ENV=production
-EB_APP_ID=<app-id-de-enable-banking>
+EB_APP_ID=<enable-banking-app-id>
 EB_PRIVATE_KEY=/home/pi/Code_Projects/robert-banking/robert_banking_production.pem
 EB_SESSION_FILE=/home/pi/Code_Projects/robert-banking/production_session.json
 
-# Ficheros y datos locales
+# Local files and data
 EB_DB=/home/pi/Code_Projects/robert-banking/data/banking.db
 EB_SHARE_DIR=/home/pi/robert-banking-share
 EB_ACCOUNT_ALIASES=/home/pi/Code_Projects/robert-banking/account_aliases.json
 
-# Publicación de la cuenta compartida
-GOOGLE_SHEET_ID=<identificador-del-documento>
+# Shared account publishing
+GOOGLE_SHEET_ID=<document-id>
 GOOGLE_SHEETS_CREDENTIALS=/home/pi/Code_Projects/robert-banking/google-sheets-service-account.json
 ```
 
-`EB_ACCOUNT_ALIASES` es opcional: si se omite, `sync_balances.py` lee por defecto `account_aliases.json` en la raíz del proyecto. Lo mismo ocurre con `EB_DB`, `EB_SHARE_DIR`, `EB_PRIVATE_KEY` y `EB_SESSION_FILE`, aunque **es preferible fijar las rutas de producción de forma explícita** para evitar cargar por accidente la sesión sandbox (valor predeterminado del script).
 
-**Variables que realmente leen los scripts:**
+`EB_ACCOUNT_ALIASES` is optional: if omitted, `sync_balances.py` reads `account_aliases.json` from the project root by default. The same applies to `EB_DB`, `EB_SHARE_DIR`, `EB_PRIVATE_KEY`, and `EB_SESSION_FILE`, although **explicitly setting production paths is preferable** to avoid accidentally loading the sandbox session (the script's default).
 
-| Variable | La utiliza | Comportamiento |
+**Environment variables actually read by the scripts:**
+
+| Variable | Used by | Behavior |
 |---|---|---|
-| `EB_ENV` | Ambos | `sandbox` o `production`; el publicador rechaza todo lo que no sea `production` |
-| `EB_APP_ID` | `sync_balances.py` | Identificador de la aplicación para crear el JWT de Enable Banking |
-| `EB_PRIVATE_KEY` | `sync_balances.py` | Ruta de la clave PEM utilizada para firmar el JWT |
-| `EB_SESSION_FILE` | `sync_balances.py` | Ruta de la sesión AIS ya autorizada |
-| `EB_DB` | Ambos | Ruta de SQLite; por defecto `data/banking.db` |
-| `EB_SHARE_DIR` | `sync_balances.py` | Directorio de salida; por defecto `/home/pi/robert-banking-share` |
-| `EB_ACCOUNT_ALIASES` | Ambos, a través de `load_account_aliases()` | Ruta opcional de alias por entorno |
-| `GOOGLE_SHEET_ID` | `publish_shared_balance.py` | ID extraído de la URL del Google Sheet |
-| `GOOGLE_SHEETS_CREDENTIALS` | `publish_shared_balance.py` | Ruta del JSON de cuenta de servicio Google |
+| `EB_ENV` | Both | `sandbox` or `production`; the publisher rejects anything other than `production` |
+| `EB_APP_ID` | `sync_balances.py` | Application identifier used to create the Enable Banking JWT |
+| `EB_PRIVATE_KEY` | `sync_balances.py` | Path to the PEM key used to sign the JWT |
+| `EB_SESSION_FILE` | `sync_balances.py` | Path to the already authorized AIS session |
+| `EB_DB` | Both | SQLite path; defaults to `data/banking.db` |
+| `EB_SHARE_DIR` | `sync_balances.py` | Output directory; defaults to `/home/pi/robert-banking-share` |
+| `EB_ACCOUNT_ALIASES` | Both, through `load_account_aliases()` | Optional path to environment-specific aliases |
+| `GOOGLE_SHEET_ID` | `publish_shared_balance.py` | ID extracted from the Google Sheet URL |
+| `GOOGLE_SHEETS_CREDENTIALS` | `publish_shared_balance.py` | Path to the Google service account JSON file |
 
-No es necesario almacenar de nuevo en `.env` el hash de la cuenta compartida: se obtiene del mapa de alias.
+There is no need to store the shared account hash again in `.env`: it is obtained from the alias mapping.
 
-### 4.2 Claves `*.pem` — privada de Enable Banking
+### 4.2 `*.pem` keys — Enable Banking private key
 
-Son ficheros PEM con la **clave privada RSA** asociada a la aplicación/sandbox correspondiente. `sync_balances.py` lee la clave y firma un JWT con el algoritmo `RS256`, cabecera `kid=EB_APP_ID`, audiencia `api.enablebanking.com`, emisor `enablebanking.com` y caducidad del token de **1 hora** por ejecución.
+These are PEM files containing the **RSA private key** associated with the corresponding application/sandbox. `sync_balances.py` reads the key and signs a JWT using the `RS256` algorithm, the header `kid=EB_APP_ID`, audience `api.enablebanking.com`, issuer `enablebanking.com`, and a token lifetime of **1 hour** per execution.
 
-- **Producción:** `robert_banking_production.pem`.
-- **Pruebas:** `robert_banking_sandbox.pem`.
-- Su contenido exacto **no se documenta ni se copia al repositorio**; se recuperan de un almacenamiento cifrado autorizado o se regeneran/registran siguiendo el procedimiento de Enable Banking.
-- Asegurarse de que la **clave pública que conserva Enable Banking corresponde a la clave privada local**.
+- **Production:** `robert_banking_production.pem`.
+- **Testing:** `robert_banking_sandbox.pem`.
+- Their exact contents **are neither documented nor copied into the repository**; recover them from authorized encrypted storage or regenerate/register them following the Enable Banking procedure.
+- Ensure that the **public key held by Enable Banking matches the local private key**.
 
-Ejemplo de permisos:
+Example permissions:
 
 ```bash
 chmod 600 .env *.pem
 ```
 
-**Nunca** pegar una clave privada real en un issue, chat, commit o archivo de ejemplo.
 
-### 4.3 `production_session.json` y `sandbox_session.json` — consentimiento AIS
+**Never** paste a real private key into an issue, chat, commit, or example file.
 
-Estos archivos representan el **resultado de una autorización bancaria**. El sincronizador necesita, entre otros datos:
+### 4.3 `production_session.json` and `sandbox_session.json` — AIS consent
+
+These files represent the **result of a banking authorization**. Among other fields, the synchronizer requires:
 
 ```json
 {
   "aspsp": {"name": "Banco de Sabadell"},
-  "access": {"valid_until": "<ISO-8601-con-zona-horaria>"},
+  "access": {"valid_until": "<ISO-8601-with-time-zone>"},
   "accounts": [
-    {"uid": "<uid-de-la-sesion>", "identification_hash": "<hash-estable-de-la-cuenta>"}
+    {"uid": "<session-uid>", "identification_hash": "<stable-account-hash>"}
   ]
 }
 ```
 
-**Esquema ilustrativo del subconjunto que consume `sync_balances.py`; no es una sesión válida para copiar literalmente, ni necesariamente la forma sin transformar de la respuesta de la API.** Debe guardarse la sesión auténtica que produzca el flujo de `authorize_sabadell.py`, con los campos que exige tu sincronizador.
 
-Cuidado con una sutileza: la API puede entregar `accounts` como lista de `uid` y datos adicionales de cuenta en `accounts_data`. El código actual de `fetch_balances()` acepta elementos `str` o `dict`, pero **si solo recibe un `uid` como string, utiliza ese `uid` como identidad**: no sirve como alias estable entre reautorizaciones. Verificar que la sesión almacenada/normalizada contiene los `identification_hash` esperados. **No construir sesiones a mano con IDs ficticios**.
+**Illustrative schema of the subset consumed by `sync_balances.py`; this is not a valid session to copy verbatim, nor is it necessarily the unmodified shape of the API response.** The genuine session produced by the `authorize_sabadell.py` flow must be saved, including the fields required by your synchronizer.
 
-La duración de la autorización **no se configura en cron**; se obtiene de `access.valid_until`, puede ser de alrededor de 180 días según banco/consentimiento y puede caducar antes. Si se revoca o expira, hay que completar una **nueva autorización bancaria**, guardar una nueva sesión y revisar que los `identification_hash` sigan coincidiendo.
+Note one subtlety: the API may return `accounts` as a list of `uid` values, with additional account data in `accounts_data`. The current `fetch_balances()` code accepts `str` or `dict` elements, but **if it receives only a `uid` string, it uses that `uid` as the account identity**: this is not a stable alias across reauthorizations. Verify that the stored/normalized session contains the expected `identification_hash` values. **Do not construct sessions manually using fictitious IDs.**
+
+The authorization duration **is not configured in cron**; it comes from `access.valid_until`, may be around 180 days depending on the bank/consent, and may expire earlier. If it is revoked or expires, a **new banking authorization** must be completed, a new session saved, and the `identification_hash` values checked for consistency.
 
 ```bash
 chmod 600 *session*.json
 ```
 
-### 4.4 `account_aliases.json` — identidad de cuentas
 
-Archivo local fundamental para distinguir las cuentas sin depender del orden de la API:
+### 4.4 `account_aliases.json` — account identity
+
+Essential local file for distinguishing accounts independently of their order in the API response:
 
 ```json
 {
   "production": {
-    "<identification_hash_cuenta_compartida>": "Cuenta compartida",
-    "<identification_hash_cuenta_personal>": "Cuenta personal"
+    "<shared_account_identification_hash>": "Cuenta compartida",
+    "<personal_account_identification_hash>": "Cuenta personal"
   },
   "sandbox": {}
 }
 ```
 
-Las claves de la sección `production` deben sustituirse por los **hashes reales obtenidos de la sesión autenticada o los datos de cuenta**. El script `load_account_aliases()` valida que no haya nombres duplicados para un entorno. Los alias se guardan también en `accounts.label` en SQLite.
 
-El publicador busca **exactamente** el alias `"Cuenta compartida"` bajo `production` y exige una única coincidencia. Si se renombra, actualizar también la constante `SHARED_ACCOUNT_LABEL` en `publish_shared_balance.py`, o parametrizarla en una futura refactorización.
+The keys in the `production` section must be replaced with the **actual hashes obtained from the authenticated session or account data**. The `load_account_aliases()` function checks that there are no duplicate names within an environment. The aliases are also stored in `accounts.label` in SQLite.
 
-### 4.5 `google-sheets-service-account.json` — credencial Google
+The publisher looks for **exactly** the alias `"Cuenta compartida"` under `production` and requires exactly one match. If it is renamed, also update the `SHARED_ACCOUNT_LABEL` constant in `publish_shared_balance.py`, or make it configurable in a future refactoring.
 
-JSON descargado al crear una **cuenta de servicio** en Google Cloud. Contiene información como `type`, `project_id`, `client_email` y **`private_key`**, entre otros campos. **No incluir su contenido real en la documentación**.
+### 4.5 `google-sheets-service-account.json` — Google credential
 
-Para recrearlo: crear proyecto Google Cloud → habilitar Google Sheets API → crear cuenta de servicio → generar una clave JSON *si la política de tu organización permite claves de cuenta de servicio* → guardar el archivo privado → **compartir un único Google Sheet** con `client_email` como **Editor**.
+JSON file downloaded when creating a **service account** in Google Cloud. Among other fields, it contains information such as `type`, `project_id`, `client_email`, and **`private_key`**. **Do not include its actual contents in the documentation.**
+
+To recreate it: create a Google Cloud project → enable the Google Sheets API → create a service account → generate a JSON key *if your organization's policy allows service account keys* → save the private file → **share one specific Google Sheet** with `client_email` as an **Editor**.
 
 ```bash
 chmod 600 google-sheets-service-account.json
 ```
 
-Se recomienda rotar/revocar credenciales de Google si se extravían; alternativamente, en una futura versión podrían utilizarse credenciales sin claves estáticas, si el entorno lo permite.
 
-### 4.6 `data/` y `*.db*` — base SQLite local
+Rotating/revoking Google credentials is recommended if they are lost. Alternatively, a future version could use credentials without static keys, if supported by the environment.
 
-`data/banking.db` se crea automáticamente en la primera sincronización correcta. No es necesario para arrancar una instalación nueva, pero **si no se restaura, se pierde el histórico de saldos**. Evitar editarlo mientras corre el servicio; para respaldos consistentes usar la API de backup de SQLite (véase [Copias](#13-seguridad-copias-y-restauración)). Los archivos `*.db-*` pueden ser auxiliares temporales de SQLite.
+### 4.6 `data/` and `*.db*` — local SQLite database
 
-### 4.7 `.venv`, cachés y otros temporales
+`data/banking.db` is created automatically during the first successful synchronization. It is not required to start a new installation, but **if it is not restored, the balance history is lost**. Avoid editing it while the service is running; use the SQLite backup API for consistent backups (see [Backups](#13-security-backups-and-restoration)). Files matching `*.db-*` may be temporary SQLite auxiliary files.
 
-Se reconstruyen a partir de `pyproject.toml` y `uv.lock` usando `uv sync --frozen`. No se incluyen en Git.
+### 4.7 `.venv`, caches, and other temporary files
 
-## 5. Modelo de datos, saldos y formatos de salida
+These can be recreated from `pyproject.toml` and `uv.lock` using `uv sync --frozen`. They are not included in Git.
 
-### 5.1 Secuencia real de `sync_balances.py`
+## 5. Data model, balances, and output formats
 
-1. Carga `.env`, sesión AIS y PEM; comprueba que `access.valid_until` no esté vencido y que existan cuentas.
-2. Genera un JWT firmado y consulta `GET /accounts/{uid}/balances` para **todas** las cuentas autorizadas. Cada petición tiene `timeout=30` segundos.
-3. Normaliza `balance_type`, `balance_amount.amount`, `currency` y `reference_date` sin perder precisión decimal al guardar en SQLite.
-4. Valida las respuestas y crea un snapshot en SQLite dentro de una transacción, persistiendo cuentas/alias/saldos.
-5. Genera un resumen y un `daily_report.txt` **deterministas**. Los totales solo suman `CLBD` por moneda y se comprueban contra las cifras desglosadas.
-6. Escribe los artefactos mediante ficheros temporales y `os.replace()`; cada archivo se sustituye atómicamente.
-7. En caso de error, escribe `status.json` en estado `error` **sin borrar `balances.json` anterior**. Por ello, el consumidor debe comprobar la **fecha** y el **estado**, no dar por vigente el último saldo encontrado.
+### 5.1 Actual `sync_balances.py` sequence
 
-**Nota de consistencia:** cada archivo se publica atómicamente por separado, pero el conjunto de los cuatro archivos **no es una transacción única**. Ante una caída entre publicaciones, comparar `fetched_at` y el `status.json` antes de combinar datos.
+1. Loads `.env`, the AIS session, and the PEM key; checks that `access.valid_until` has not expired and that accounts are present.
+2. Generates a signed JWT and calls `GET /accounts/{uid}/balances` for **all** authorized accounts. Each request has a `timeout=30` seconds.
+3. Normalizes `balance_type`, `balance_amount.amount`, `currency`, and `reference_date` without losing decimal precision when saving to SQLite.
+4. Validates the responses and creates a snapshot in SQLite within a transaction, persisting accounts, aliases, and balances.
+5. Generates a **deterministic** summary and `daily_report.txt`. Totals add only `CLBD` amounts per currency and are checked against the itemized figures.
+6. Writes artifacts using temporary files and `os.replace()`; each file is replaced atomically.
+7. On error, writes `status.json` with status `error` **without deleting the previous `balances.json`**. Therefore, consumers must check the **timestamp** and **status**, rather than assuming the most recent balance found is current.
 
-### 5.2 Tablas SQLite
+**Consistency note:** each file is published atomically and separately, but the four files together **do not form a single transaction**. If a failure occurs between file publications, compare `fetched_at` and `status.json` before combining data.
 
-| Tabla | Contenido relevante |
+### 5.2 SQLite tables
+
+| Table | Relevant contents |
 |---|---|
-| `accounts` | `environment`, `bank`, `identification_hash`, `label`; combinación única por entorno/banco/hash |
+| `accounts` | `environment`, `bank`, `identification_hash`, `label`; unique combination of environment/bank/hash |
 | `snapshots` | `environment`, `bank`, `fetched_at`, `consent_valid_until` |
-| `balances` | `snapshot_id`, `account_id`, `balance_type`, `currency`, `amount` (texto decimal), `reference_date` |
+| `balances` | `snapshot_id`, `account_id`, `balance_type`, `currency`, `amount` (decimal text), `reference_date` |
 
-Cada sincronización crea un nuevo snapshot. No almacena, en su versión actual, transferencias ni movimientos individuales.
+Each synchronization creates a new snapshot. In the current version, it stores neither transfers nor individual transactions.
 
-### 5.3 Archivos de intercambio con Hermes
+### 5.3 Files exchanged with Hermes
 
-Ubicación predeterminada en **host**: `/home/pi/robert-banking-share/` (o `EB_SHARE_DIR`). En el ejemplo de contenedor se montan en `/opt/data/banking/`.
+Default location on the **host**: `/home/pi/robert-banking-share/` (or `EB_SHARE_DIR`). In the container example, they are mounted at `/opt/data/banking/`.
 
-| Archivo | Escribe | Lee | Qué contiene |
+| File | Written by | Read by | Contents |
 |---|---|---|---|
-| `balances.json` | `sync_balances.py` | Hermes | Último resumen completo, lista de cuentas/saldos, totales `CLBD`, consentimiento y `report_text` |
-| `history.json` | `sync_balances.py` | Hermes | Último snapshot de cada día **local** (`Europe/Madrid`), hasta 30 días; datos `CLBD` |
-| `daily_report.txt` | `sync_balances.py` | Hermes / skill | Informe ya formateado con importes por cuenta, total contable y vencimiento del consentimiento |
-| `status.json` | `sync_balances.py` | Hermes / skill | Estado de la última tentativa (`ok`/`error`), hora y mensaje; si hubo error, último éxito conocido |
+| `balances.json` | `sync_balances.py` | Hermes | Latest complete summary, account/balance list, `CLBD` totals, consent, and `report_text` |
+| `history.json` | `sync_balances.py` | Hermes | Last snapshot of each **local** day (`Europe/Madrid`), for up to 30 days; `CLBD` data |
+| `daily_report.txt` | `sync_balances.py` | Hermes / skill | Preformatted report showing amounts per account, total booked balance, and consent expiration |
+| `status.json` | `sync_balances.py` | Hermes / skill | Status of the latest attempt (`ok`/`error`), time, and message; if an error occurred, the last known success |
 
-**Ejemplos de formato (cifras e identidades ficticias):**
+**Format examples (fictitious amounts and identities):**
 
-`balances.json` — fragmento representativo:
+`balances.json` — representative excerpt:
 
 ```json
 {
@@ -322,7 +332,8 @@ Ubicación predeterminada en **host**: `/home/pi/robert-banking-share/` (o `EB_S
 }
 ```
 
-`history.json` — estructura simplificada:
+
+`history.json` — simplified structure:
 
 ```json
 {
@@ -341,9 +352,10 @@ Ubicación predeterminada en **host**: `/home/pi/robert-banking-share/` (o `EB_S
 }
 ```
 
-El registro de ejemplo de `history.json` omite intencionadamente la segunda cuenta por brevedad, **pero en la salida real `accounts` y el total del día incluyen todas las cuentas con CLBD**.
 
-`status.json` en éxito:
+The sample `history.json` record intentionally omits the second account for brevity, **but in the actual output, `accounts` and the daily total include all accounts with a CLBD balance**.
+
+`status.json` on success:
 
 ```json
 {
@@ -354,7 +366,8 @@ El registro de ejemplo de `history.json` omite intencionadamente la segunda cuen
 }
 ```
 
-`status.json` en error (ejemplo):
+
+`status.json` on error (example):
 
 ```json
 {
@@ -365,47 +378,50 @@ El registro de ejemplo de `history.json` omite intencionadamente la segunda cuen
 }
 ```
 
-`daily_report.txt` contiene cifras **calculadas por Python**, no por el LLM. El agente **no debe sumar de nuevo** saldos heterogéneos, ni convertir XPCD en CLBD.
 
-## 6. Instalación desde cero
+`daily_report.txt` contains figures **calculated by Python**, not by the LLM. The agent **must not re-add** balances of different types or convert XPCD into CLBD.
 
-### 6.1 Requisitos
+## 6. Installation from scratch
 
-- Raspberry Pi con Linux, Python compatible con el `pyproject.toml`, `uv`, Git y salida HTTPS.
-- Un entorno Hermes Agent previamente instalado y configurado si se necesitan informes por mensajería.
-- Aplicación Enable Banking válida; para acceso personal puede estar **Active + Restricted**, con las cuentas autorizadas en *Linked accounts*.
-- Consentimiento bancario válido para las cuentas elegidas.
-- Para Sheets: Google Cloud, Sheets API, cuenta de servicio y una hoja privada compartida explícitamente con ella.
+### 6.1 Requirements
 
-### 6.2 Clonar e instalar dependencias
+- A Raspberry Pi running Linux, Python compatible with `pyproject.toml`, `uv`, Git, and outbound HTTPS access.
+- A previously installed and configured Hermes Agent environment, if messaging reports are required.
+- A valid Enable Banking application; for personal access, it may be **Active + Restricted**, with authorized accounts listed under *Linked accounts*.
+- Valid banking consent for the selected accounts.
+- For Sheets: Google Cloud, the Sheets API, a service account, and a private spreadsheet explicitly shared with that account.
+
+### 6.2 Clone and install dependencies
 
 ```bash
 mkdir -p /home/pi/Code_Projects
 cd /home/pi/Code_Projects
-# git clone <URL-REAL-DEL-REPOSITORIO> robert-banking
+# git clone <ACTUAL-REPOSITORY-URL> robert-banking
 cd robert-banking
 uv sync --frozen
 ```
 
-No se incluye aquí un URL de Git inventado: sustituir el comentario por el remoto real. El código importado necesita `PyJWT` (`jwt`), `requests`, `python-dotenv`; el publicador además requiere `gspread` y `google-auth`. Comprobar que están declarados en `pyproject.toml`/`uv.lock`; si faltan:
+
+No fictitious Git URL is provided here: replace the comment with the actual remote URL. The imported code requires `PyJWT` (`jwt`), `requests`, and `python-dotenv`; the publisher additionally requires `gspread` and `google-auth`. Check that they are declared in `pyproject.toml`/`uv.lock`; if any are missing:
 
 ```bash
 uv add PyJWT requests python-dotenv gspread google-auth
 ```
 
-`uv add` actualiza `pyproject.toml` y `uv.lock`: **versionar ambos cambios**. No usar `uv pip install` como mecanismo de reproducibilidad si las dependencias no quedan registradas.
 
-### 6.3 Restaurar los archivos privados
+`uv add` updates `pyproject.toml` and `uv.lock`: **commit both changes to version control**. Do not use `uv pip install` as a reproducibility mechanism if the dependencies are not recorded.
 
-1. Crear `.env` con el esquema de [4.1](#41-env--configuración-local-no-commit).
-2. Colocar la clave de producción `robert_banking_production.pem` que corresponda a la **clave pública configurada en Enable Banking**.
-3. Completar el flujo de autorización AIS con `authorize_sabadell.py` y guardar su sesión real en `production_session.json`. **No se documentan argumentos CLI inventados**, porque el contenido de ese script no fue inspeccionado en la preparación de este README.
-4. Crear `account_aliases.json` con los `identification_hash` efectivos y los alias `Cuenta compartida` / `Cuenta personal`.
-5. Crear el JSON de cuenta de servicio Google y el Google Sheet. La integración de Sheets puede posponerse hasta tener funcionando la sincronización bancaria.
+### 6.3 Restore private files
 
-El procedimiento de autorización de Enable Banking consta, a grandes rasgos, de iniciar `POST /auth`, completar autenticación bancaria y crear la sesión con `POST /sessions` a partir del código de autorización. **Usar el script existente**, revisar sus instrucciones y no pegar identificadores de sesión ni códigos de autorización en documentación pública.
+1. Create `.env` using the template in [4.1](#41-env--local-configuration-do-not-commit).
+2. Place the production key `robert_banking_production.pem`, ensuring it corresponds to the **public key configured in Enable Banking**.
+3. Complete the AIS authorization flow with `authorize_sabadell.py` and save the actual session in `production_session.json`. **No invented CLI arguments are documented**, because the contents of that script were not inspected when preparing this README.
+4. Create `account_aliases.json` with the actual `identification_hash` values and the aliases `Cuenta compartida` / `Cuenta personal`.
+5. Create the Google service account JSON file and the Google Sheet. The Sheets integration can be postponed until bank synchronization is working.
 
-Comprobar que la sesión y los alias coinciden sin imprimir secretos:
+Broadly speaking, the Enable Banking authorization procedure consists of initiating `POST /auth`, completing bank authentication, and creating the session with `POST /sessions` using the authorization code. **Use the existing script**, review its instructions, and do not paste session identifiers or authorization codes into public documentation.
+
+Check that the session and aliases match without printing secrets:
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -413,25 +429,27 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sync_balances import load_account_aliases
 load_dotenv('.env')
-print('Alias configurados:', list(load_account_aliases('production').values()))
-print('Fichero de sesión presente:', Path('production_session.json').is_file())
+print('Configured aliases:', list(load_account_aliases('production').values()))
+print('Session file present:', Path('production_session.json').is_file())
 PY
 ```
 
-### 6.4 Preparar el directorio de salida y permisos
+
+### 6.4 Prepare the output directory and permissions
 
 ```bash
 sudo install -d -o pi -g pi -m 700 /home/pi/robert-banking-share
 mkdir -p data
 chmod 700 data
 chmod 600 .env *.pem *session*.json account_aliases.json
-# Si existe la credencial de Google en la raíz:
+# If the Google credential is in the project root:
 chmod 600 google-sheets-service-account.json
 ```
 
-El usuario que ejecuta systemd es `pi`, por lo que debe poder **leer** los secretos y **escribir** en `data/` y `EB_SHARE_DIR`.
 
-### 6.5 Primera sincronización
+The user running systemd is `pi`, so it must be able to **read** the secrets and **write** to `data/` and `EB_SHARE_DIR`.
+
+### 6.5 First synchronization
 
 ```bash
 cd /home/pi/Code_Projects/robert-banking
@@ -440,17 +458,18 @@ cd /home/pi/Code_Projects/robert-banking
 cat /home/pi/robert-banking-share/daily_report.txt
 ```
 
-Si falla, consultar el estado, confirmar `EB_ENV=production`, revisar `access.valid_until` de la sesión **sin publicarlo**, y revisar los logs/HTTP de Enable Banking. `sync_balances.py` devuelve código de salida distinto de cero en caso de error.
 
-## 7. Servicio systemd y cron de Linux
+If it fails, inspect the status, confirm `EB_ENV=production`, check the session's `access.valid_until` **without publishing it**, and review Enable Banking logs/HTTP responses. `sync_balances.py` returns a nonzero exit code on error.
 
-### 7.1 Unidad de servicio
+## 7. systemd service and Linux cron
 
-Archivo del host: `/etc/systemd/system/robert-banking.service`.
+### 7.1 Service unit
+
+Host file: `/etc/systemd/system/robert-banking.service`.
 
 ```ini
 [Unit]
-Description=Robert Banking - Sincronización de saldos y publicación de cuenta compartida
+Description=Robert Banking - Balance synchronization and shared account publishing
 Wants=network-online.target
 After=network-online.target
 
@@ -468,15 +487,16 @@ TimeoutStartSec=240
 NoNewPrivileges=true
 ```
 
-- `Type=oneshot`: se inicia, ejecuta los scripts y termina; **no es un demonio permanente**.
-- `EnvironmentFile`: systemd carga las variables del `.env`; los scripts también lo hacen con `python-dotenv`.
-- `UMask=0077`: restringe permisos de nuevos archivos.
-- `ExecStartPost`: solo se alcanza si `ExecStart` termina exitosamente.
-- El prefijo **`-`** ante el publicador hace que un error de subida a Sheets **no marque la sincronización bancaria como fallida**. Ese error **sí aparecerá en el journal**: se debe vigilar por separado.
-- `TimeoutStartSec=240`: tiempo máximo para los comandos de arranque de esta unidad.
-- No se necesita `[Install]` / `WantedBy=multi-user.target` porque el disparador previsto es cron, no el inicio automático del sistema.
 
-Instalación y prueba:
+- `Type=oneshot`: starts, runs the scripts, and exits; **it is not a continuously running daemon**.
+- `EnvironmentFile`: systemd loads variables from `.env`; the scripts also load them using `python-dotenv`.
+- `UMask=0077`: restricts permissions on newly created files.
+- `ExecStartPost`: is reached only if `ExecStart` completes successfully.
+- The **`-`** prefix before the publisher means that a failure to upload to Sheets **does not mark the banking synchronization as failed**. The error **will still appear in the journal** and must be monitored separately.
+- `TimeoutStartSec=240`: maximum time allowed for this unit's startup commands.
+- No `[Install]` / `WantedBy=multi-user.target` is needed because the intended trigger is cron, not automatic startup at boot.
+
+Installation and test:
 
 ```bash
 sudo nano /etc/systemd/system/robert-banking.service
@@ -486,35 +506,39 @@ sudo systemctl status robert-banking.service --no-pager
 sudo journalctl -u robert-banking.service -n 100 --no-pager
 ```
 
-Después de una ejecución correcta, `inactive (dead)` **es normal** para `Type=oneshot`.
 
-### 7.2 Crontab del host
+After a successful run, `inactive (dead)` **is normal** for `Type=oneshot`.
 
-Se edita el **crontab de root** porque llama a `systemctl start`:
+### 7.2 Host crontab
+
+Edit the **root crontab** because it invokes `systemctl start`:
 
 ```bash
 sudo crontab -e
 ```
+
 
 ```cron
 # m h dom mon dow command
 55 7,12,18 * * * /usr/bin/systemctl start robert-banking.service
 ```
 
-En la zona horaria local `Europe/Madrid`, esto dispara el servicio todos los días a las **07:55**, **12:55** y **18:55**. Confirmar la zona del host con:
+
+In the local `Europe/Madrid` time zone, this starts the service every day at **07:55**, **12:55**, and **18:55**. Confirm the host's time zone with:
 
 ```bash
 timedatectl
 sudo crontab -l
 ```
 
-No hace falta reiniciar cron después de editar el crontab. El cron del host **no tiene relación con el cron de Hermes**.
 
-## 8. Carpeta compartida entre la Raspberry y Hermes
+There is no need to restart cron after editing the crontab. The host cron **is unrelated to Hermes cron**.
 
-El programa bancario **no vive dentro del contenedor**: se ejecuta en el host con credenciales bancarias que el contenedor no debe ver.
+## 8. Shared directory between the Raspberry Pi and Hermes
 
-### 8.1 Directorio del host
+The banking application **does not run inside the container**: it runs on the host with banking credentials that the container must not be able to access.
+
+### 8.1 Host directory
 
 ```text
 /home/pi/robert-banking-share/
@@ -524,11 +548,12 @@ El programa bancario **no vive dentro del contenedor**: se ejecuta en el host co
 └── status.json
 ```
 
-`sync_balances.py` **escribe** estos cuatro archivos. El contenedor de Hermes únicamente los **lee**. SQLite, `.env`, PEM y sesiones **no deben montarse dentro del contenedor**.
 
-### 8.2 Ejemplo de bind mount en Portainer / Docker
+`sync_balances.py` **writes** these four files. The Hermes container only **reads** them. SQLite, `.env`, PEM keys, and sessions **must not be mounted inside the container**.
 
-**Ejemplo de reconstrucción: comprobar que coincide con el stack real.** Añadir al servicio/contenedor Hermes:
+### 8.2 Bind-mount example for Portainer / Docker
+
+**Reconstruction example: verify that it matches the actual stack.** Add the following to the Hermes service/container:
 
 ```yaml
 services:
@@ -537,41 +562,43 @@ services:
       - /home/pi/robert-banking-share:/opt/data/banking:ro
 ```
 
-`ro` es **read-only desde el contenedor**. En este ejemplo:
 
-| Host Raspberry | Dentro del contenedor Hermes |
+`ro` means **read-only from the container**. In this example:
+
+| Raspberry Pi host | Inside the Hermes container |
 |---|---|
 | `/home/pi/robert-banking-share/status.json` | `/opt/data/banking/status.json` |
 | `/home/pi/robert-banking-share/balances.json` | `/opt/data/banking/balances.json` |
 | `/home/pi/robert-banking-share/history.json` | `/opt/data/banking/history.json` |
 | `/home/pi/robert-banking-share/daily_report.txt` | `/opt/data/banking/daily_report.txt` |
 
-Verificar el nombre del contenedor en Portainer o con `docker ps`, y después:
+Check the container name in Portainer or with `docker ps`, then run:
 
 ```bash
-docker exec <NOMBRE_O_ID_DEL_CONTENEDOR_HERMES> \
+docker exec <HERMES_CONTAINER_NAME_OR_ID> \
   sh -c 'id; ls -la /opt/data/banking; cat /opt/data/banking/status.json'
 ```
 
-> **Permisos:** el host publica archivos con modo `0600` y directorios restrictivos. `:ro` impide escribir, **pero no concede permiso de lectura por sí solo**. El UID/GID efectivo de Hermes debe tener acceso al directorio; en la instalación se ha utilizado la opción `HERMES_UID/HERMES_GID=1000`, que conviene verificar contra `id pi`. No resolver problemas de permisos con `chmod 777` ni montando el proyecto bancario entero.
 
-### 8.3 Contrato para el consumidor
+> **Permissions:** the host publishes files with mode `0600` and restrictively permissioned directories. `:ro` prevents writing, **but does not grant read permission by itself**. The effective Hermes UID/GID must be able to access the directory; the installation has used `HERMES_UID/HERMES_GID=1000`, which should be checked against `id pi`. Do not fix permissions issues by using `chmod 777` or mounting the entire banking project.
 
-Orden recomendado de lectura para Robert:
+### 8.3 Consumer contract
 
-1. **`status.json` primero.** Si `status != "ok"`, advertir fallo y no describir cifras antiguas como recién consultadas.
-2. Comparar `last_success_at` con `balances.json.fetched_at`; advertir si las fechas no cuadran o los datos son antiguos.
-3. Para un informe diario, **reproducir `daily_report.txt`** o el `report_text` del JSON, sin inventar cifras.
-4. Leer `history.json` solo para preguntas sobre evolución histórica; recordar que contiene como máximo un punto por día local, no movimientos.
-5. Diferenciar siempre **saldo contable** (`CLBD`) de **saldo disponible** (no garantizado).
+Recommended reading order for Robert:
 
-## 9. Skill `banking-monitor` y cron de Hermes
+1. **Read `status.json` first.** If `status != "ok"`, report the failure and do not describe old figures as freshly retrieved.
+2. Compare `last_success_at` with `balances.json.fetched_at`; warn if the timestamps do not match or the data is stale.
+3. For a daily report, **reproduce `daily_report.txt`** or the JSON `report_text` without inventing figures.
+4. Read `history.json` only for questions about historical trends; remember that it contains at most one data point per local day, not transactions.
+5. Always distinguish the **booked balance** (`CLBD`) from the **available balance** (not guaranteed).
 
-Hermes utiliza **skills** como instrucciones cargables y tiene **su propio scheduler**. La skill enseña al agente **cómo interpretar los archivos**; el cron decide **cuándo invocarla**. No es un servidor MCP y no tiene acceso directo a Enable Banking.
+## 9. `banking-monitor` skill and Hermes cron
 
-### 9.1 Dónde se guarda la skill
+Hermes uses **skills** as loadable instructions and has **its own scheduler**. The skill teaches the agent **how to interpret the files**; cron determines **when to invoke it**. It is not an MCP server and does not have direct access to Enable Banking.
 
-Según la instalación estándar de Hermes, las skills están en `~/.hermes/skills/`. Para esta instalación se ha utilizado el nombre **`banking-monitor`** y la ruta de datos `/opt/data/banking/`.
+### 9.1 Where the skill is stored
+
+Under the standard Hermes installation, skills are located in `~/.hermes/skills/`. This installation has used the name **`banking-monitor`** and the data path `/opt/data/banking/`.
 
 ```text
 ~/.hermes/skills/
@@ -579,134 +606,139 @@ Según la instalación estándar de Hermes, las skills están en `~/.hermes/skil
     └── SKILL.md
 ```
 
-La ubicación corresponde **al sistema de archivos del perfil Hermes dentro de Docker**; debe estar cubierta por el volumen persistente de Hermes si quieres conservarla al recrear el contenedor.
 
-### 9.2 Contenido propuesto para `banking-monitor/SKILL.md`
+This location is **in the filesystem of the Hermes profile inside Docker**; it must be covered by the persistent Hermes volume if you want it to survive container recreation.
 
-> **Plantilla de reconstrucción, NO transcripción comprobada de la skill actualmente instalada.** Es seguro versionar esta plantilla en el futuro dentro de `docs/hermes/banking-monitor/SKILL.md` si no contiene datos reales.
+### 9.2 Proposed contents of `banking-monitor/SKILL.md`
+
+> **Reconstruction template, NOT a verified transcription of the currently installed skill.** This template can safely be version-controlled in `docs/hermes/banking-monitor/SKILL.md` in the future, provided it contains no real personal data.
 
 ````markdown
 ---
 name: banking-monitor
-description: Lee y explica los informes bancarios de Robert desde archivos locales de solo lectura.
+description: Reads and explains Robert’s banking reports from local read-only files.
 ---
 
 # Banking Monitor (read-only)
 
-## Fuente única de datos
-- Directorio: `/opt/data/banking/`.
-- Leer `status.json` antes de cualquier respuesta.
-- En un informe diario usar `daily_report.txt` literalmente como fuente de importes.
-- `balances.json` sirve para preguntas sobre el último snapshot.
-- `history.json` sirve únicamente para tendencias por días, no para movimientos.
+## Single source of data
+- Directory: `/opt/data/banking/`.
+- Read `status.json` before responding.
+- For a daily report, use `daily_report.txt` verbatim as the source for amounts.
+- Use `balances.json` for questions about the latest snapshot.
+- Use `history.json` only for daily trends, not transactions.
 
-## Procedimiento
-1. Abrir y validar `status.json`.
-2. Si `status=error`, informar del fallo y de `last_success_at`.
-3. Si no hay informe o es antiguo, explicitar la antigüedad.
-4. Si `status=ok`, leer `daily_report.txt` y reproducir sus importes.
-5. Para preguntas adicionales, consultar `balances.json` / `history.json`.
+## Procedure
+1. Open and validate `status.json`.
+2. If `status=error`, report the failure and `last_success_at`.
+3. If no report is available or it is stale, explicitly state its age.
+4. If `status=ok`, read `daily_report.txt` and reproduce its amounts.
+5. For additional questions, consult `balances.json` / `history.json`.
 
-## Reglas críticas
-- Nunca afirmar que `CLBD` es saldo disponible.
-- Nunca mezclar `CLBD` con `XPCD` o sumar tipos de saldo distintos.
-- Nunca recalcular el total del informe con el LLM ni inventar cifras.
-- Nunca leer o solicitar PEM, tokens, sesiones, `.env` o IBAN completos.
-- Nunca modificar archivos bancarios ni iniciar pagos.
-- No confundir una consulta antigua con datos en tiempo real.
+## Critical rules
+- Never state that `CLBD` is the available balance.
+- Never mix `CLBD` with `XPCD` or add different balance types.
+- Never recalculate the report total using the LLM or invent figures.
+- Never read or request PEM keys, tokens, sessions, `.env`, or full IBANs.
+- Never modify banking files or initiate payments.
+- Do not mistake an old query for real-time data.
 ````
 
-En una instalación nueva, copiar esta plantilla al directorio de skills del perfil **y probar su invocación**. Si ya existe una skill más completa, usar su contenido real como fuente y actualizar este README, en vez de sobrescribirla sin revisión.
 
-### 9.3 Cron de Hermes: resumen matutino
+In a new installation, copy this template to the profile's skills directory **and test its invocation**. If a more comprehensive skill already exists, use its actual contents as the source and update this README instead of overwriting it without review.
 
-En las conversaciones de configuración se utilizó el nombre **`Robert - Resumen Sabadell`** y se propuso una programación a las **08:05 (Europe/Madrid)**, después de la primera sincronización del host a las 07:55. **No se ha comprobado el job actualmente guardado por Hermes; el comando siguiente reconstruye ese comportamiento propuesto.**
+### 9.3 Hermes cron: morning summary
+
+During setup discussions, the name **`Robert - Resumen Sabadell`** was used, and a schedule of **08:05 (Europe/Madrid)** was proposed, after the host's first synchronization at 07:55. **The job currently stored by Hermes has not been checked; the following command reconstructs that proposed behavior.**
 
 ```bash
 hermes cron create '5 8 * * *' \
-  'Usa la skill banking-monitor. Comprueba /opt/data/banking/status.json y, si el estado es ok y la consulta es reciente, reproduce fielmente /opt/data/banking/daily_report.txt. No recalcules importes. Si hubo fallo o los datos están desactualizados, avisa explícitamente. No presentes CLBD como disponible.' \
+  'Use the banking-monitor skill. Check /opt/data/banking/status.json and, if the status is ok and the query is recent, faithfully reproduce /opt/data/banking/daily_report.txt. Do not recalculate amounts. If an error occurred or the data is stale, explicitly warn about it. Do not present CLBD as available funds.' \
   --timezone Europe/Madrid \
   --skill banking-monitor \
   --name 'Robert - Resumen Sabadell' \
   --deliver telegram
 ```
 
-Este comando **crea un job nuevo**. Antes de ejecutarlo en una instalación donde Robert ya funciona, listar los jobs para **evitar duplicados**:
+
+This command **creates a new job**. Before running it in an installation where Robert is already operational, list the jobs to **avoid duplicates**:
 
 ```bash
 hermes cron list
 hermes cron status
-# Probar un job existente por su identificador (no crear otro):
+# Test an existing job by its ID (do not create another):
 hermes cron run <JOB_ID>
 ```
 
-Los jobs están guardados por Hermes en `~/.hermes/cron/jobs.json`, **fuera del repositorio bancario**; se ejecutan desde el gateway, en sesiones independientes del chat. Para recibir por Telegram, el gateway debe tener previamente configurado ese canal. Guardar la definición del job (sin secretos) en la documentación o como recurso de despliegue si se desea reproducirlo automáticamente.
 
-**Temporización:** `08:05` deja 10 minutos respecto del cron de host de `07:55`. Si la Raspberry estaba apagada, si la llamada a Sabadell falló o si la sincronización se retrasa, Robert debe reconocerlo leyendo `status.json` y la marca temporal. Un cron de Hermes **no fuerza por sí mismo** la sincronización bancaria.
+Hermes stores its jobs in `~/.hermes/cron/jobs.json`, **outside the banking repository**; they run from the gateway in sessions independent of the chat. To receive messages via Telegram, that channel must already be configured in the gateway. Save the job definition (without secrets) in the documentation or as a deployment resource if you want to reproduce it automatically.
 
-## 10. Publicación a Google Sheets y consumo desde Claude
+**Timing:** `08:05` leaves a 10-minute gap after the host cron at `07:55`. If the Raspberry Pi was switched off, the Sabadell request failed, or synchronization was delayed, Robert must recognize this by reading `status.json` and the timestamp. A Hermes cron job **does not itself trigger** banking synchronization.
 
-### 10.1 Qué hace `publish_shared_balance.py`
+## 10. Publishing to Google Sheets and accessing data from Claude
 
-El publicador:
+### 10.1 What `publish_shared_balance.py` does
 
-1. Exige `EB_ENV=production`.
-2. Llama a `load_account_aliases('production')` desde `sync_balances.py` y localiza **exactamente una** `Cuenta compartida`.
-3. Abre SQLite en **modo lectura** y selecciona el snapshot más reciente de `production`.
-4. Extrae **exactamente un saldo `CLBD` en `EUR`** para ese `identification_hash`; comprueba la etiqueta almacenada.
-5. Publica la información en **el primer tab** del Google Sheet configurado, rango `A1:F2`.
+The publisher:
 
-No consulta de nuevo a Enable Banking ni publica los importes de `Cuenta personal`.
+1. Requires `EB_ENV=production`.
+2. Calls `load_account_aliases('production')` from `sync_balances.py` and identifies **exactly one** `Cuenta compartida`.
+3. Opens SQLite in **read-only mode** and selects the most recent `production` snapshot.
+4. Extracts **exactly one `CLBD` balance in `EUR`** for that `identification_hash`; checks the stored label.
+5. Publishes the information to **the first tab** of the configured Google Sheet, range `A1:F2`.
 
-Campos en el Sheet:
+It does not query Enable Banking again or publish the amounts from `Cuenta personal`.
 
-| Columna | Contenido |
+Fields in the Sheet:
+
+| Column | Contents |
 |---|---|
-| `A` Cuenta | `Cuenta compartida` |
-| `B` Saldo contable (EUR) | Número `CLBD` de esa cuenta |
-| `C` Saldo disponible (EUR) | **En blanco**: el script no lo conoce |
-| `D` Última consulta | `fetched_at` convertido a `Europe/Madrid` |
-| `E` Referencia del banco | `reference_date`, si viene en la API |
-| `F` Tipo de saldo | `CLBD (contable)` |
+| `A` `Cuenta` (Account) | `Cuenta compartida` |
+| `B` `Saldo contable (EUR)` (Booked balance) | The account's numeric `CLBD` value |
+| `C` `Saldo disponible (EUR)` (Available balance) | **Blank**: the script does not know this value |
+| `D` `Última consulta` (Last retrieval) | `fetched_at` converted to `Europe/Madrid` |
+| `E` `Referencia del banco` (Bank reference) | `reference_date`, if provided by the API |
+| `F` `Tipo de saldo` (Balance type) | `CLBD (contable)` |
 
-**Ojo con la antigüedad:** la versión de `publish_shared_balance.py` compartida durante el desarrollo contenía una **barrera de 30 minutos** para no publicar snapshots antiguos. Posteriormente se acordó que era preferible publicar el último dato disponible y enseñar su fecha, manteniendo únicamente la comprobación de fechas futuras. **La captura del repositorio no permite verificar si esa modificación ya se aplicó al archivo local**. Revisar el bloque `age = ...` del archivo real: si sigue rechazando `age > timedelta(minutes=30)`, esa condición explica los errores al publicar manualmente tiempo después de sincronizar. No confundir el error del publicador con un fallo de la consulta bancaria.
+**Note on data age:** the version of `publish_shared_balance.py` shared during development contained a **30-minute cutoff** to prevent publishing old snapshots. It was subsequently agreed that publishing the most recent available data and showing its timestamp was preferable, retaining only the check for future dates. **The repository screenshot does not establish whether that change has already been applied to the local file.** Review the `age = ...` block in the actual file: if it still rejects `age > timedelta(minutes=30)`, that condition explains errors when publishing manually long after synchronization. Do not confuse a publisher error with a failed bank query.
 
-### 10.2 Configuración de Google
+### 10.2 Google configuration
 
-1. Crear un Google Sheet privado, por ejemplo **Finanzas compartidas - Robert**.
-2. En Google Cloud, habilitar **Google Sheets API**, crear una cuenta de servicio y obtener credenciales JSON.
-3. Guardar el JSON en el host, referido por `GOOGLE_SHEETS_CREDENTIALS`.
-4. Compartir **solo esa hoja** con el `client_email` de la cuenta de servicio, rol **Editor**.
-5. Compartirla con la pareja, rol **Lector**. Mantener `Acceso general: Restringido`.
-6. Poner el ID del documento (segmento entre `/d/` y `/edit` en su URL) en `GOOGLE_SHEET_ID`.
+1. Create a private Google Sheet, for example **Finanzas compartidas - Robert**.
+2. In Google Cloud, enable the **Google Sheets API**, create a service account, and obtain JSON credentials.
+3. Save the JSON file on the host, referenced by `GOOGLE_SHEETS_CREDENTIALS`.
+4. Share **only that spreadsheet** with the service account's `client_email`, granting the **Editor** role.
+5. Share it with your partner, granting the **Viewer** role. Keep `General access: Restricted`.
+6. Set `GOOGLE_SHEET_ID` to the document ID (the segment between `/d/` and `/edit` in its URL).
 
-No hay que publicar la hoja ni abrir ningún puerto en el router. Google Sheets es un **destino de publicación**, no el lugar donde se almacenan las claves de banco.
+There is no need to publish the spreadsheet or open any router ports. Google Sheets is a **publishing destination**, not a place to store banking keys.
 
-### 10.3 Pruebas del publicador
+### 10.3 Publisher tests
 
 ```bash
 cd /home/pi/Code_Projects/robert-banking
-.venv/bin/python publish_shared_balance.py --dry-run  # solo valida selección/SQLite
-.venv/bin/python publish_shared_balance.py            # escribe realmente el Sheet
+.venv/bin/python publish_shared_balance.py --dry-run  # validates selection/SQLite only
+.venv/bin/python publish_shared_balance.py            # actually writes to the Sheet
 ```
 
-El `--dry-run` de este script comprueba datos locales **sin contactar con Google**. Si la publicación falla pero `ExecStart` fue correcta, la unidad puede terminar sin fallo gracias al prefijo `-` en `ExecStartPost`; consultar siempre el journal y la fecha de la hoja.
 
-### 10.4 Claude y el calendario de pagos
+This script's `--dry-run` checks local data **without contacting Google**. If publishing fails but `ExecStart` succeeded, the unit may still finish without an error because of the `-` prefix in `ExecStartPost`; always check the journal and the date shown in the spreadsheet.
 
-Claude de la pareja puede utilizar el conector de Google Drive/Sheets para leer **esa hoja privada** y contrastarla con las fechas e importes de **Google Calendar**, si su modalidad y sus automatizaciones admiten ambos conectores. Reglas sugeridas para su prompt:
+### 10.4 Claude and the payment calendar
 
-- Comprobar la fecha `Última consulta` y advertir cuando sea antigua (por ejemplo, **más de 24 horas**).
-- Interpretar la columna B como **saldo contable**, no como dinero garantizado para pagos.
-- No inventar cargos que no figuren en Calendar ni restar movimientos supuestos.
-- No mostrar otras cuentas: la hoja contiene solo la cuenta compartida.
-- No inferir saldo disponible cuando su columna está vacía.
+Your partner's Claude can use the Google Drive/Sheets connector to read **that private spreadsheet** and compare it with payment dates and amounts in **Google Calendar**, if their plan and automations support both connectors. Suggested rules for its prompt:
 
-El Google Sheet y su permiso para Claude son **independientes** de la skill y cron de Hermes.
+- Check the `Última consulta` (last retrieval) date and warn when it is old (for example, **more than 24 hours**).
+- Interpret column B as the **booked balance**, not as funds guaranteed to be available for payments.
+- Do not invent charges not listed in Calendar or subtract assumed transactions.
+- Do not show other accounts: the spreadsheet contains only the shared account.
+- Do not infer the available balance when its column is blank.
 
-## 11. Pruebas y verificación
+The Google Sheet and Claude's access permissions are **independent** of the Hermes skill and cron job.
 
-### 11.1 Host: permisos, dependencias y salud
+## 11. Testing and verification
+
+### 11.1 Host: permissions, dependencies, and health
 
 ```bash
 cd /home/pi/Code_Projects/robert-banking
@@ -718,7 +750,8 @@ sudo journalctl -u robert-banking.service --since today --no-pager
 sudo crontab -l
 ```
 
-### 11.2 Datos de salida
+
+### 11.2 Output data
 
 ```bash
 ls -lah /home/pi/robert-banking-share
@@ -727,7 +760,8 @@ ls -lah /home/pi/robert-banking-share
 cat /home/pi/robert-banking-share/daily_report.txt
 ```
 
-### 11.3 Comprobar la base sin volcar importes al terminal
+
+### 11.3 Check the database without printing amounts to the terminal
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -742,76 +776,78 @@ with sqlite3.connect(p) as db:
 PY
 ```
 
-### 11.4 Docker y Hermes
+
+### 11.4 Docker and Hermes
 
 ```bash
-# Reemplazar por el nombre real del contenedor
+# Replace with the actual container name
 docker ps --format '{{.Names}}'
-docker exec <CONTENEDOR_HERMES> sh -c \
-  'test -r /opt/data/banking/daily_report.txt && echo OK-LECTURA'
-# Dentro del entorno en el que existe el CLI Hermes:
+docker exec <HERMES_CONTAINER> sh -c \
+  'test -r /opt/data/banking/daily_report.txt && echo READ-OK'
+# Inside the environment where the Hermes CLI is available:
 hermes cron list
 ```
 
-## 12. Errores frecuentes y mantenimiento
 
-| Síntoma | Posible causa | Qué comprobar |
+## 12. Common errors and maintenance
+
+| Symptom | Possible cause | What to check |
 |---|---|---|
-| `ConsentExpired` | `access.valid_until` ya pasó | Reautorizar la cuenta y guardar nueva sesión válida |
-| HTTP 401 / `EXPIRED_SESSION` | Revocación temprana o sesión inválida | No fiarse solo de la fecha: revisar código de error y reautorizar |
-| `EB_ENV` no es production | Variable ausente o equivocada | `.env` y `EnvironmentFile` de systemd |
-| Alias desconocido o no coincide | `account_aliases.json` incompleto o nuevo hash | Revisar identidades de sesión y alias; evitar comparar por orden |
-| `CLBD` ausente | Banco no proporciona ese tipo para una cuenta | No inventar saldo ni sumarlo con `XPCD` |
-| `SQLite` no existe | `EB_DB` incorrecto o nunca se sincronizó | Crear `data/`, revisar permisos y ejecutar `sync_balances.py` |
-| `status.json` en error, `balances.json` presente | Falló el último intento pero quedó el snapshot anterior | Leer `last_success_at`, `fetched_at` y tratarlo como dato antiguo |
-| No se publica Sheets pero el banco funciona | Credenciales Google, API, permisos o antigüedad | Ejecutar publicador manual y revisar `journalctl` |
-| Google `SpreadsheetNotFound` o 403 | ID de hoja erróneo / falta compartir con service account | Comprobar `GOOGLE_SHEET_ID` y `client_email` como Editor |
-| Error `más de 30 minutos` | Filtro de antigüedad del publicador anterior | Revisar si el código aún mantiene ese límite |
-| Hermes no puede leer archivos | Bind mount incorrecto o usuario/UID sin permisos | Revisar ruta `:ro`, `docker exec ... id`, permisos 700/600 |
-| Telegram no envía el resumen | Gateway parado, job ausente, canal no configurado | `hermes cron status`, `hermes cron list` y logs del gateway |
-| La unidad figura `inactive (dead)` | Normal en `Type=oneshot` | Revisar el código de salida y el journal, no exigir `active (running)` |
+| `ConsentExpired` | `access.valid_until` has passed | Reauthorize the account and save a new valid session |
+| HTTP 401 / `EXPIRED_SESSION` | Early revocation or invalid session | Do not rely solely on the date: check the error code and reauthorize |
+| `EB_ENV` is not production | Missing or incorrect variable | `.env` and systemd's `EnvironmentFile` |
+| Unknown or mismatched alias | Incomplete `account_aliases.json` or new hash | Review session identities and aliases; avoid matching by order |
+| Missing `CLBD` | The bank does not provide that balance type for an account | Do not invent a balance or add it to `XPCD` |
+| `SQLite` does not exist | Incorrect `EB_DB` or synchronization has never run | Create `data/`, check permissions, and run `sync_balances.py` |
+| `status.json` reports an error but `balances.json` exists | The latest attempt failed but the previous snapshot remains | Read `last_success_at` and `fetched_at`, and treat the data as stale |
+| Sheets is not updated but bank access works | Google credentials, API, permissions, or data age | Run the publisher manually and review `journalctl` |
+| Google `SpreadsheetNotFound` or 403 | Incorrect spreadsheet ID / spreadsheet not shared with service account | Check `GOOGLE_SHEET_ID` and that `client_email` has Editor access |
+| `más de 30 minutos` error | Previous publisher's age filter | Check whether the code still enforces that limit |
+| Hermes cannot read files | Incorrect bind mount or user/UID lacks permissions | Check the `:ro` path, `docker exec ... id`, and 700/600 permissions |
+| Telegram does not send the summary | Gateway stopped, job missing, or channel not configured | `hermes cron status`, `hermes cron list`, and gateway logs |
+| Unit shows `inactive (dead)` | Normal for `Type=oneshot` | Check the exit code and journal; do not expect `active (running)` |
 
-### Renovación de consentimiento
+### Consent renewal
 
-1. Comprobar el `consent_valid_until` o el informe diario; planificar la renovación antes de la fecha límite.
-2. Completar **una nueva autorización del usuario** desde `authorize_sabadell.py`/Enable Banking.
-3. Guardar la sesión actualizada en el archivo configurado por `EB_SESSION_FILE`.
-4. Comprobar que los `identification_hash` permiten asociar correctamente las cuentas nuevas con los alias existentes.
-5. Ejecutar una sincronización manual y comprobar `status.json`, informe y publicación a Sheets.
+1. Check `consent_valid_until` or the daily report; schedule renewal before the deadline.
+2. Complete **a new user authorization** via `authorize_sabadell.py`/Enable Banking.
+3. Save the updated session to the file configured by `EB_SESSION_FILE`.
+4. Verify that the `identification_hash` values correctly associate the new accounts with the existing aliases.
+5. Run a manual synchronization and check `status.json`, the report, and publication to Sheets.
 
-### Sobre la zona horaria y los límites del histórico
+### Time zone and historical data limits
 
-- Los instantes de consulta se guardan en UTC (con zona horaria).
-- Los informes y el histórico diario se presentan/agrupan por `Europe/Madrid`.
-- El histórico de Hermes conserva como máximo **30 días** y toma el último snapshot por día local; SQLite conserva todos los snapshots almacenados, salvo mantenimiento manual.
+- Retrieval timestamps are stored in UTC (with time zone information).
+- Reports and daily history are displayed/grouped using `Europe/Madrid`.
+- Hermes history retains at most **30 days** and uses the last snapshot for each local day; SQLite keeps all stored snapshots unless manually maintained.
 
-## 13. Seguridad, copias y restauración
+## 13. Security, backups, and restoration
 
-### 13.1 Principios de separación
+### 13.1 Separation principles
 
-- **Host Raspberry:** PEM, `.env`, sesión AIS, hashes, SQLite; ejecuta las consultas a Enable Banking y la publicación a Google.
-- **Hermes/Docker:** solo cuatro archivos exportados y, preferentemente, montados `:ro`; nunca el directorio bancario entero.
-- **Google Sheets:** solo CLBD de `Cuenta compartida` y fechas, nunca los datos de `Cuenta personal` ni credenciales.
-- **Claude:** acceso por permisos Google al documento compartido, no al host ni a la API bancaria.
+- **Raspberry Pi host:** PEM keys, `.env`, AIS session, hashes, and SQLite; runs Enable Banking requests and publishes to Google.
+- **Hermes/Docker:** only the four exported files, preferably mounted `:ro`; never the entire banking directory.
+- **Google Sheets:** only the CLBD balance of `Cuenta compartida` and dates, never `Cuenta personal` data or credentials.
+- **Claude:** access to the shared document through Google permissions, not to the host or banking API.
 
-Evitar `privileged: true`, montar `/var/run/docker.sock`, montar `/` o `/home/pi/Code_Projects/robert-banking` dentro del contenedor para resolver permisos.
+Avoid using `privileged: true` or mounting `/var/run/docker.sock`, `/`, or `/home/pi/Code_Projects/robert-banking` inside the container to resolve permissions issues.
 
-### 13.2 Qué respaldar
+### 13.2 What to back up
 
-| Objeto | Versionar en Git | Copia privada/cifrada | Reproducible sin backup |
+| Item | Version-control in Git | Private/encrypted backup | Reproducible without backup |
 |---|---:|---:|---:|
-| Código, `pyproject.toml`, `uv.lock`, README | Sí | Opcional | Sí, desde Git |
-| `.env` | **No** | Sí (sin divulgar) | Sí, reconfigurando valores |
-| PEM de producción / sandbox | **No** | Sí, con control estricto | Solo regenerando/registrando según proveedor |
-| Sesiones JSON | **No** | Según política de seguridad | Nueva autorización bancaria |
-| `account_aliases.json` | **No** en esta configuración | Sí, cifrada | Sí, si se recuperan hashes/alias correctos |
-| `google-sheets-service-account.json` | **No** | Según política de claves | Sí, generando nueva credencial y revocando antigua |
-| `data/banking.db` | **No** | **Sí**, si importa conservar histórico | No: se inicia nuevo histórico |
-| `robert-banking.service` y crontab | Actualmente fuera del repo | **Sí**, o documentarlos/exportarlos | Sí, siguiendo este README |
-| Skill y jobs de Hermes | Actualmente fuera del repo | **Sí**, respaldar sin secretos | Parcial: aquí hay una plantilla, no copia de su estado real |
-| Directorio `/home/pi/robert-banking-share` | **No** | Opcional | Sí, tras sincronización correcta |
+| Code, `pyproject.toml`, `uv.lock`, README | Yes | Optional | Yes, from Git |
+| `.env` | **No** | Yes (without disclosure) | Yes, by reconfiguring values |
+| Production / sandbox PEM keys | **No** | Yes, with strict controls | Only by regenerating/registering according to the provider |
+| JSON sessions | **No** | According to security policy | New banking authorization |
+| `account_aliases.json` | **No** in this configuration | Yes, encrypted | Yes, if the correct hashes/aliases can be recovered |
+| `google-sheets-service-account.json` | **No** | According to key-management policy | Yes, by generating a new credential and revoking the old one |
+| `data/banking.db` | **No** | **Yes**, if preserving history matters | No: a new history starts |
+| `robert-banking.service` and crontab | Currently outside the repo | **Yes**, or document/export them | Yes, by following this README |
+| Hermes skill and jobs | Currently outside the repo | **Yes**, back up without secrets | Partially: this README provides a template, not a copy of their actual state |
+| `/home/pi/robert-banking-share` directory | **No** | Optional | Yes, after successful synchronization |
 
-Backup consistente de SQLite:
+Consistent SQLite backup:
 
 ```bash
 cd /home/pi/Code_Projects/robert-banking
@@ -822,46 +858,47 @@ load_dotenv('.env')
 source = os.getenv('EB_DB', 'data/banking.db')
 with sqlite3.connect(source) as src, sqlite3.connect('/home/pi/banking-backup.db') as dst:
     src.backup(dst)
-print('Backup SQLite creado en /home/pi/banking-backup.db')
+print('SQLite backup created at /home/pi/banking-backup.db')
 PY
 chmod 600 /home/pi/banking-backup.db
 ```
 
-**Importante:** mover el backup a un soporte **cifrado** con permisos adecuados. El ejemplo lo crea en el host y **no lo cifra automáticamente**.
 
-### 13.3 Lista de restauración
+**Important:** move the backup to **encrypted** storage with appropriate permissions. The example creates it on the host and **does not encrypt it automatically**.
 
-- [ ] Recuperar Git y `uv sync --frozen`.
-- [ ] Restaurar `.env`, PEM y sesiones **o generar una nueva autorización válida**.
-- [ ] Restaurar/reconstruir `account_aliases.json`; comprobar nombres exactos y hashes.
-- [ ] Restaurar `banking.db` si se necesita el histórico; en otro caso, crear uno nuevo.
-- [ ] Reconstruir Google Sheet + cuenta de servicio/permisos y configurar su ID.
-- [ ] Crear `EB_SHARE_DIR`, ajustar propietarios/permisos y ejecutar sincronización manual.
-- [ ] Instalar systemd y el crontab del host.
-- [ ] Restaurar volumen persistente de Hermes y su configuración de Telegram.
-- [ ] Restaurar el bind mount `:ro`, skill y definición del job de Hermes.
-- [ ] Comprobar las fechas y los importes sin confundir CLBD y disponible.
+### 13.3 Restoration checklist
 
-## 14. Referencias y puntos pendientes
+- [ ] Restore the Git repository and run `uv sync --frozen`.
+- [ ] Restore `.env`, PEM keys, and sessions **or obtain a new valid authorization**.
+- [ ] Restore/recreate `account_aliases.json`; verify exact names and hashes.
+- [ ] Restore `banking.db` if historical data is needed; otherwise, create a new database.
+- [ ] Recreate the Google Sheet + service account/permissions and configure its ID.
+- [ ] Create `EB_SHARE_DIR`, set ownership/permissions, and run a manual synchronization.
+- [ ] Install the systemd unit and host crontab.
+- [ ] Restore the persistent Hermes volume and its Telegram configuration.
+- [ ] Restore the `:ro` bind mount, skill, and Hermes job definition.
+- [ ] Verify dates and amounts without confusing CLBD with the available balance.
 
-### Documentación oficial
+## 14. References and outstanding items
+
+### Official documentation
 
 - [Enable Banking — Quick Start API](https://enablebanking.com/docs/api/quick-start/)
 - [Enable Banking — API Reference](https://enablebanking.com/docs/api/reference/)
-- [Enable Banking — FAQ: sesiones, caducidad y reautorización](https://enablebanking.com/docs/faq/)
+- [Enable Banking — FAQ: sessions, expiration, and reauthorization](https://enablebanking.com/docs/faq/)
 - [Hermes — Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
 - [Hermes — Creating Skills](https://hermes-agent.nousresearch.com/docs/developer-guide/creating-skills)
 - [Hermes — Scheduled Tasks (Cron)](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)
 
-### Para dejar esta documentación 100 % equivalente al despliegue real
+### To make this documentation fully match the actual deployment
 
-Este README está diseñado para que el proyecto sea reproducible, pero todavía hay algunos **elementos externos al repositorio cuyo contenido exacto no ha sido contrastado**:
+This README is designed to make the project reproducible, but there are still some **elements outside the repository whose exact contents have not been verified**:
 
-1. **`authorize_sabadell.py`:** documentar su CLI real, sus parámetros y cómo guarda la sesión normalizada.
-2. **`SKILL.md` instalado en Hermes:** exportar su versión actual (sin información personal) y contrastarla con la plantilla de este README.
-3. **Cron real de Hermes:** guardar la salida de `hermes cron list` y el prompt/configuración del job `Robert - Resumen Sabadell` sin identificadores de chat ni secretos.
-4. **Stack de Docker/Portainer:** conservar un ejemplo del volumen real y de los IDs de usuario usados, sin tokens.
-5. **Publicador de Sheets:** confirmar si ya se eliminó el filtro de antigüedad de 30 minutos en el código del repositorio.
-6. **Configuración del servicio:** conservar una copia versionada de la unidad systemd (no contiene secretos) o automatizar su instalación.
+1. **`authorize_sabadell.py`:** document its actual CLI, arguments, and how it saves the normalized session.
+2. **`SKILL.md` installed in Hermes:** export the current version (without personal information) and compare it with the template in this README.
+3. **Actual Hermes cron job:** save the output of `hermes cron list` and the prompt/configuration of the `Robert - Resumen Sabadell` job without chat identifiers or secrets.
+4. **Docker/Portainer stack:** keep an example of the actual volume mount and user IDs, without tokens.
+5. **Sheets publisher:** confirm whether the 30-minute age filter has already been removed from the repository code.
+6. **Service configuration:** keep a version-controlled copy of the systemd unit (it contains no secrets) or automate its installation.
 
-Con esas seis comprobaciones se podría convertir este README, que ya cubre contratos y procedimientos de reconstrucción, en una **documentación fiel al 100 % de la instalación concreta**.
+With these six checks, this README—which already covers data contracts and reconstruction procedures—could become **documentation that is fully faithful to the specific installation**.
